@@ -106,7 +106,7 @@ GCP setup: a project with billing linked, a chosen region (this guide uses `euro
 Define shell variables once (used in the manual setup steps; the pipeline reads its own from secrets):
 
 ```bash
-export PROJECT_ID=your-gcp-project-id
+export PROJECT_ID=cloud-application-utm
 export REGION=europe-west1
 export CLUSTER=ac-cluster
 export DOCKER_REPO=eamtc/cloud_application
@@ -130,12 +130,19 @@ gcloud services enable \
 
 Autopilot creates a regional, node-autoscaled cluster. Provisioning takes ~5–8 minutes.
 
+Install the GKE kubectl auth plugin once so `kubectl` can use credentials from `get-credentials`:
+
 ```bash
+gcloud components install gke-gcloud-auth-plugin
+
 gcloud container clusters create-auto "$CLUSTER" \
   --region="$REGION" \
   --release-channel=regular
 
 gcloud container clusters get-credentials "$CLUSTER" --region="$REGION"
+
+kubectl cluster-info
+
 kubectl get nodes        # sanity check
 ```
 
