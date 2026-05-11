@@ -1,0 +1,56 @@
+name: Deploy to GKE
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Image tag to deploy from Docker Hub (must already exist, e.g. v0.0.1 or latest)."
+        required: true
+        type: string
+
+env:
+  IMAGE: docker.io/eamtc/cloud_application
+
+jobs:
+  deploy:
+    name: Deploy to GKE
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Set up gcloud
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ secrets.GCP_PROJECT_ID }}
+
+      - name: Install GKE auth plugin
+        run: gcloud components install gke-gcloud-auth-plugin --quiet
+
+      - name: Fetch cluster credentials
+        run: |
+          gcloud container clusters get-credentials "${{ secrets.GKE_CLUSTER }}" \
+            --region "${{ secrets.GCP_REGION }}" \
+            --project "${{ secrets.GCP_PROJECT_ID }}"
+
+      - name: Apply manifests
+        run: kubectl apply -f k8s/
+
+      - name: Roll out chosen image
+        run: |
+          kubectl -n ac set image deployment/api \
+            api=${{ env.IMAGE }}:${{ inputs.tag }}
+          kubectl -n ac rollout status deployment/api --timeout=5m
+
+      - name: Show service status
+        if: always()
+        run: |
+          kubectl -n ac get deploy,svc,hpa,pods -o wide || true
