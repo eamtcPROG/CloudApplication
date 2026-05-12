@@ -6,6 +6,6 @@ export class AppService {
 
   getHello(): string {
     this.logger.log("getHello() called from service");
-    return "Hello World!";
+    return "Hello World! From API";
   }
 }
