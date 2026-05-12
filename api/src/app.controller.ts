@@ -1,6 +1,8 @@
 import { Controller, Get, Logger } from "@nestjs/common";
+import { ApiTags } from "@nestjs/swagger";
 import { AppService } from "./app.service";
 
+@ApiTags("root")
 @Controller()
 export class AppController {
   private readonly logger = new Logger(AppController.name);
@@ -11,11 +13,5 @@ export class AppController {
   getHello(): string {
     this.logger.log("Root endpoint hit");
     return this.appService.getHello();
-  }
-
-  @Get("health")
-  health(): { status: string } {
-    this.logger.log("Health check endpoint hit");
-    return { status: "ok" };
   }
 }
