@@ -379,10 +379,10 @@ The committed [`k8s/db-secret.yaml`](k8s/db-secret.yaml) carries a placeholder p
 ```bash
 kubectl -n ac create secret generic db-credentials \
   --from-literal=POSTGRES_USER=postgres \
-  --from-literal=POSTGRES_PASSWORD="" \
+  --from-literal=POSTGRES_PASSWORD= \
   --from-literal=POSTGRES_DB=ac \
   --from-literal=DB_USER=postgres \
-  --from-literal=DB_PASSWORD="" \
+  --from-literal=DB_PASSWORD= \
   --dry-run=client -o yaml | kubectl apply -f -
 
 kubectl -n ac rollout restart statefulset/db
