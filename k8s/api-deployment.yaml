@@ -26,6 +26,34 @@ spec:
         runAsUser: 1000
         seccompProfile:
           type: RuntimeDefault
+      initContainers:
+        - name: wait-for-db
+          image: postgres:18
+          command:
+            - sh
+            - -c
+            - |
+              until pg_isready -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER"; do
+                echo "waiting for db at $DB_HOST:$DB_PORT...";
+                sleep 2;
+              done
+          envFrom:
+            - configMapRef:
+                name: api-config
+            - secretRef:
+                name: db-credentials
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "64Mi"
+            limits:
+              cpu: "100m"
+              memory: "128Mi"
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
       containers:
         - name: api
           image: docker.io/eamtc/cloud_application:latest
@@ -35,6 +63,8 @@ spec:
           envFrom:
             - configMapRef:
                 name: api-config
+            - secretRef:
+                name: db-credentials
           resources:
             requests:
               cpu: "250m"

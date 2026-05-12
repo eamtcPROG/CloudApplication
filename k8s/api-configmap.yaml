@@ -6,3 +6,6 @@ metadata:
 data:
   PORT: "3000"
   NODE_ENV: "production"
+  DB_HOST: "db"
+  DB_PORT: "5432"
+  DB_NAME: "ac"

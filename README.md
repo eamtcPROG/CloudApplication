@@ -61,7 +61,7 @@ In this project the image is published publicly to Docker Hub at [`eamtc/cloud_a
 
 ## Deploying to GKE (Google Kubernetes Engine)
 
-This section is an end-to-end guide for putting the API on a production-style Kubernetes cluster in Google Cloud, with a GitHub Actions pipeline doing the build/push/deploy on every git tag. It maps every numbered requirement above to a concrete artifact — see the table in section L.
+This section is an end-to-end guide for putting the API on a production-style Kubernetes cluster in Google Cloud, with a GitHub Actions pipeline doing the build/push/deploy on every git tag. It maps every numbered requirement above to a concrete artifact — see the table in section M.
 
 ### What you'll build
 
@@ -80,13 +80,19 @@ git tag v0.0.2 ─▶ docker build api/         (manual run with tag input)
                                   Internet ─▶ GCP LoadBalancer
                                               └─▶ GKE Autopilot (ac-cluster)
                                                   └── ns: ac
-                                                       └── api Deployment
-                                                           (replicas≥2, HPA 2→5,
-                                                            RollingUpdate)
+                                                       ├── api Deployment
+                                                       │   (replicas≥2, HPA 2→5,
+                                                       │    RollingUpdate)
+                                                       │      │
+                                                       │      ▼  postgres://db:5432
+                                                       └── db StatefulSet
+                                                           (postgres:18, 1 replica)
+                                                           └─ PVC db-data-db-0
+                                                              └─ GCE PersistentDisk
                                   Cloud Logging + Cloud Monitoring (automatic)
 ```
 
-This deploy is intentionally **stateless** — there is no database in the cluster. The additional requirements 3 and 4 (DB in a separate container, mounted storage) are not addressed by this guide.
+This deploy includes an in-cluster **PostgreSQL** instance running as a `StatefulSet` backed by a `PersistentVolumeClaim` — satisfying additional requirements 3 (DB in a separate container) and 4 (storage mounted to the database container). See section [L](#l-database-additional-requirements-a3-a4) for details.
 
 ### Choices made (and the tradeoffs)
 
@@ -95,7 +101,7 @@ This deploy is intentionally **stateless** — there is no database in the clust
 | **GKE Autopilot** (not Standard) | Google manages nodes, node autoscaling is built-in, billing per-pod | No custom node pools, less low-level control |
 | **`Service: LoadBalancer`** (not Ingress) | One YAML, public IP in ~60s — fastest path to requirement 5 | No L7 routing, no managed TLS (upgrade: Ingress + ManagedCertificate) |
 | **Service Account JSON key for GHA auth** (not Workload Identity Federation) | Two commands to set up, one secret to paste | A long-lived credential lives in GitHub secrets — rotate periodically; production should use WIF |
-| **Stateless deploy — no database** | Keeps the moving parts to a minimum; the API today doesn't need persistence | Additional requirements 3 & 4 are not addressed — add a managed DB (Cloud SQL) or an in-cluster StatefulSet when persistence is needed |
+| **In-cluster Postgres `StatefulSet` + `PVC`** (not Cloud SQL) | One namespace, one set of credentials, literally meets A3 (separate container) and A4 (mounted storage) for the course | Single-pod Postgres has no HA — production should switch to Cloud SQL or a Postgres operator (CloudNativePG, Zalando) for replication and backups |
 
 ### A. Prerequisites
 
@@ -187,10 +193,14 @@ The cluster's desired state lives under [`k8s/`](k8s):
 | File | Purpose |
 |---|---|
 | [`k8s/namespace.yaml`](k8s/namespace.yaml) | Isolates everything in the `ac` namespace |
-| [`k8s/api-configmap.yaml`](k8s/api-configmap.yaml) | Runtime env: `PORT`, `NODE_ENV` |
-| [`k8s/api-deployment.yaml`](k8s/api-deployment.yaml) | API workload, 2 replicas, rolling update, readiness/liveness on `/health` |
+| [`k8s/api-configmap.yaml`](k8s/api-configmap.yaml) | API runtime env: `PORT`, `NODE_ENV`, `DB_HOST`, `DB_PORT`, `DB_NAME` |
+| [`k8s/api-deployment.yaml`](k8s/api-deployment.yaml) | API workload, 2 replicas, rolling update, readiness/liveness on `/health`, init container waits for DB |
 | [`k8s/api-service.yaml`](k8s/api-service.yaml) | `LoadBalancer` — public IP on port 80 → pod port 3000 (req. 5) |
 | [`k8s/api-hpa.yaml`](k8s/api-hpa.yaml) | CPU-based HPA, min 2 / max 5 (req. 10) |
+| [`k8s/db-secret.yaml`](k8s/db-secret.yaml) | Postgres credentials (`POSTGRES_USER/PASSWORD/DB`, `DB_USER/PASSWORD`). **Rotate before any real deploy.** |
+| [`k8s/db-configmap.yaml`](k8s/db-configmap.yaml) | Non-secret Postgres tunables (`PGDATA`) |
+| [`k8s/db-statefulset.yaml`](k8s/db-statefulset.yaml) | Postgres 18 `StatefulSet`, `volumeClaimTemplates: 10Gi` on `standard-rwo` — satisfies A3 + A4 |
+| [`k8s/db-service.yaml`](k8s/db-service.yaml) | Headless `Service` named `db` so the API resolves Postgres at `db:5432` |
 
 Why the key fields matter:
 
@@ -346,7 +356,109 @@ gcloud iam service-accounts delete "$SA_EMAIL" --quiet
 
 Also remove the six GitHub Actions secrets when you're done with the project.
 
-### L. Requirements traceability
+### L. Database (additional requirements A3, A4)
+
+The cluster runs **PostgreSQL 18** as an in-cluster `StatefulSet` with a `volumeClaimTemplate` — this is the artifact that satisfies the two additional storage requirements:
+
+- **A3 — DB in a separate container**: a dedicated `postgres:18` container in its own pod (`db-0`), in a separate workload (`StatefulSet/db`) from the API `Deployment`.
+- **A4 — Storage mounted to the DB**: a `PersistentVolumeClaim` (`db-data-db-0`) provisioned from GKE's default `standard-rwo` `StorageClass`, mounted at `/var/lib/postgresql/data` on the Postgres pod. The PVC is backed by a GCE PersistentDisk — data survives pod restarts, image rolls, and StatefulSet redeploys.
+
+#### L.1 Manifests
+
+See the table in section [E](#e-kubernetes-manifests-k8s) — the four `db-*.yaml` files. Together they:
+
+1. Create a `Secret` (`db-credentials`) consumed by both Postgres (`POSTGRES_USER/PASSWORD/DB`) and the API (`DB_USER/DB_PASSWORD`).
+2. Run a single Postgres pod with `pg_isready` readiness/liveness probes.
+3. Expose Postgres at `db.ac.svc.cluster.local:5432` via a headless `Service`.
+4. Bind a 10 Gi GCE PersistentDisk through the `volumeClaimTemplate`.
+
+#### L.2 Rotating the password before a real deploy
+
+The committed [`k8s/db-secret.yaml`](k8s/db-secret.yaml) carries a placeholder password (`change-me-in-cluster`) so the manifest applies cleanly out of the box. **Before deploying anywhere shared, replace it:**
+
+```bash
+kubectl -n ac create secret generic db-credentials \
+  --from-literal=POSTGRES_USER=postgres \
+  --from-literal=POSTGRES_PASSWORD="" \
+  --from-literal=POSTGRES_DB=ac \
+  --from-literal=DB_USER=postgres \
+  --from-literal=DB_PASSWORD="" \
+  --dry-run=client -o yaml | kubectl apply -f -
+
+kubectl -n ac rollout restart statefulset/db
+kubectl -n ac rollout restart deployment/api
+```
+
+The two `DB_*` keys mirror the `POSTGRES_*` keys because the API expects `DB_USER`/`DB_PASSWORD` and Postgres expects `POSTGRES_USER`/`POSTGRES_PASSWORD`. Keep them in sync.
+
+#### L.3 Migrations
+
+TypeORM migrations run automatically when the API process starts (`migrationsRun: true` in [api/src/app.module.ts](api/src/app.module.ts)). The current migration is [api/src/migrations/1700000000000-InitItems.ts](api/src/migrations/1700000000000-InitItems.ts), which creates the `items` table.
+
+To create a new migration locally against a dev database:
+
+```bash
+cd api
+DB_HOST=localhost npm run migration:generate -- src/migrations/<Name>
+```
+
+Commit the generated file; it will run on the next API rollout.
+
+#### L.4 Ad-hoc access
+
+Open a psql shell inside the Postgres pod for one-off queries:
+
+```bash
+kubectl -n ac exec -it db-0 -- psql -U "$POSTGRES_USER" -d "$POSTGRES_DB"
+```
+
+#### L.5 Backups
+
+A simple manual dump:
+
+```bash
+kubectl -n ac exec db-0 -- sh -c 'pg_dump -U "$POSTGRES_USER" "$POSTGRES_DB"' > ac-$(date +%F).sql
+```
+
+For automation, schedule a Kubernetes `CronJob` that runs `pg_dump` and uploads to GCS, or switch to Cloud SQL (which has managed PITR backups built in).
+
+#### L.6 Verifying persistence (A4 proof)
+
+```bash
+# Insert a row through the API
+curl -XPOST "http://$EXTERNAL_IP/items" \
+  -H 'content-type: application/json' \
+  -d '{"name":"survives-restart"}'
+
+# Force the Postgres pod to restart
+kubectl -n ac delete pod db-0
+kubectl -n ac rollout status statefulset/db
+
+# Same row should still be there
+curl "http://$EXTERNAL_IP/items"
+```
+
+If the row survives, the PVC is doing its job.
+
+#### L.7 API documentation (Swagger / OpenAPI)
+
+The NestJS app serves an interactive Swagger UI at `/docs` and the raw OpenAPI document at `/docs-json`. Both are wired up in [api/src/main.ts](api/src/main.ts) with `@nestjs/swagger`. Controllers and DTOs are annotated with `@ApiTags`, `@ApiOperation`, `@ApiResponse`, and `@ApiProperty`, so the documentation stays in sync with the code by construction.
+
+```bash
+open "http://$EXTERNAL_IP/docs"          # Swagger UI
+curl "http://$EXTERNAL_IP/docs-json"     # OpenAPI 3 JSON
+```
+
+The `/items` CRUD and `/health` endpoints are documented there.
+
+#### L.8 Upgrade path
+
+When persistence needs to outgrow a single pod:
+
+- **Cloud SQL for PostgreSQL** — managed HA, automatic backups, PITR. Add a Cloud SQL Auth Proxy sidecar to the API Deployment and point `DB_HOST` at `127.0.0.1`.
+- **CloudNativePG** or **Zalando postgres-operator** — keep things in-cluster but get a replicated cluster, scheduled `pg_dump` jobs, and rolling failovers.
+
+### M. Requirements traceability
 
 | # | Requirement | Satisfied by | Section / file |
 |---|---|---|---|
@@ -362,5 +474,5 @@ Also remove the six GitHub Actions secrets when you're done with the project.
 | 10 | Autoscaling on load | HPA + Autopilot node autoscaler | [`k8s/api-hpa.yaml`](k8s/api-hpa.yaml), I |
 | A1 | Centralised logs | Cloud Logging (auto) + optional Loki | J |
 | A2 | Metrics → monitoring | Cloud Monitoring (auto) + optional `prom-client` | J |
-| A3 | DB in separate container | **Not addressed** — deploy is stateless by design | — |
-| A4 | Storage mounted to DB | **Not addressed** — no database in this deploy | — |
+| A3 | DB in separate container | Postgres 18 `StatefulSet` in its own pod | [`k8s/db-statefulset.yaml`](k8s/db-statefulset.yaml), L |
+| A4 | Storage mounted to DB | `volumeClaimTemplate` → GCE PersistentDisk mounted at `/var/lib/postgresql/data` | [`k8s/db-statefulset.yaml`](k8s/db-statefulset.yaml), L.6 |
